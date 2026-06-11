@@ -1,0 +1,16 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Omniverse / Kit generated files
+*.log
+*.lock
+.nvidia-omniverse/
+
+# Runtime debug dumps written by the extension
+_*.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini

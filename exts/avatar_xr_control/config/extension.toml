@@ -1,0 +1,16 @@
+[package]
+title = "Avatar XR Control"
+version = "1.0.0"
+description = "Drives a UsdSkel avatar from XR head tracking via SkelAnimation. Debug spheres and first-person camera included."
+category = "Simulation"
+keywords = ["avatar", "xr", "vr", "skeleton", "animation", "quest"]
+authors = ["Institut Setup"]
+
+[dependencies]
+"omni.kit.uiapp" = {}
+"omni.ui" = {}
+"omni.usd" = {}
+"omni.kit.xr.core" = {}
+
+[[python.module]]
+name = "avatar.xr.control"
