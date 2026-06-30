@@ -32,54 +32,74 @@ the boundary; rest data stays in its native (working) frame.
 
 ---
 
+## ⚠ KEY INSIGHT #2 (collider placement — the physics-layer saga)
+The avatar is posed through a bound **`SkelAnimation`** (`write_joint_rotation`
+sets the anim's rotation array). The skinned **mesh** deforms from that, but the
+joint **prim** transforms (the `OmniJoint` prims) stay at **bind pose** — they
+never move. So `ComputeLocalToWorldTransform` on a bone prim only reflects the
+ROOT motion, not the live pose. The body-collider proxies must therefore be
+driven from `UsdSkelSkeletonQuery.ComputeJointWorldTransforms(..., atRest=False)`
+(render-faithful posed joints), **not** from the bone prims and **not** from the
+cached-rest reconstruction (which ignores the live spine/clavicle pose and
+drifts up to ~0.5 m at the hand). Same lesson as insight #1: drive everything
+from the one frame the mesh actually uses.
+
+---
+
 # PART A — CURRENT PROJECT STATUS
 
 ## A.1 One-line summary
-An NVIDIA Omniverse Kit extension (`avatar.xr.control`) that drives a
-UsdSkel-rigged avatar in real time from a Meta Quest VR headset (via ALVR +
-OpenXR) and ALVR's VRChat Body-OSC stream, writing per-frame joint rotations
-to a bound `SkelAnimation` prim.
+An NVIDIA Omniverse / Isaac Sim Kit extension (`avatar.xr.control`) that drives a
+UsdSkel-rigged avatar in real time from a Meta Quest headset (OpenXR). Head,
+arms (analytic two-bone IK), and hand orientation track the HMD + controllers;
+the legs are animated by a procedural walking gait; and the body interacts with
+the scene through a kinematic PhysX collider layer (push and grab dynamic
+objects). Per-frame joint rotations go to a bound `SkelAnimation` prim. Now
+~6,400 LOC across the main module + `crouch_sit.py` + tests.
 
 ## A.2 What works right now
-| Body part | Input source | Method | Status |
+| Capability | Input source | Method | Status |
 |---|---|---|---|
-| Head (yaw/pitch/roll) | OpenXR HMD pose | `_correct_xr_quat` → direct local write | ✅ working |
-| Waist / torso lean | ALVR OSC hip + chest positions | shortest-arc `_bone_rotation_from_vectors` + 5° X tilt | ✅ working (when OSC stream live) |
-| Hand rotation (wrist) | OpenXR controller/hand pose | world→local via forearm-rest, T-pose calibration offset, fixed axis remap | ✅ working (user pre-corrected incoming data) |
-| Arm position (shoulder+elbow) | OpenXR wrist position + 2-bone IK | analytic IK, T-pose anchored, scaled | 🟡 in tuning (reach scale + pole) |
-| Fingers (30 joints) | OpenXR hand-tracking joint poses | direct world-quat write | ❌ no data on Quest 2 w/ controllers |
-| Legs / feet / knees | — | — | ❌ not implemented |
+| Head (yaw/pitch/roll) | OpenXR HMD pose | corrected XR quat → direct local write | ✅ working |
+| Arms (shoulder/elbow/wrist position) | OpenXR controller position + 2-bone IK | analytic IK in skeleton-local frame, clavicle follow, adaptive elbow pole/swivel | ✅ validated |
+| Hand / wrist orientation | OpenXR controller pose | right-multiplied controller-frame offset + forearm-roll routing (no wrist clamp) | ✅ validated 2026-06-22 |
+| Fingers | controller trigger/grip | procedural curl (optical finger data unavailable with controllers) | ✅ (procedural) |
+| Legs / walking | avatar root velocity | procedural Route-B gait: foot-placement IK, pelvis drop, heel/toe roll + floor-clearance lift | ✅ on by default |
+| Crouch & sit | HMD height vs calibrated standing height | `CrouchSitController` + leg bend / pelvis drop | ✅ |
+| First-person view | OpenXR HMD | eye-point camera follow + non-deforming head-region hide | ✅ |
+| Physics interaction | kinematic collider proxies tracking posed joints | torso/head/arm/palm colliders push dynamic rigid bodies; trigger-grab (dynamic RB only) | ✅ on by default |
+| Torso lean via OSC | ALVR VRChat Body-OSC | UDP receiver retained but reserved/optional | 🟡 optional |
+| Locomotion | right thumbstick | glide XR rig; avatar follows via camera-follow | ✅ |
 
-## A.3 Active work — 2-bone arm IK (in tuning)
-- **Implemented:** analytic 2-bone IK (`_solve_two_bone_ik`), shoulder/elbow/
-  wrist rest data + bone lengths in `_AvatarSkel`, T-pose calibration capture of
-  the XR wrist anchor and a span-derived scale, per-frame `_apply_arm_ik`.
-- **Axis mapping found empirically:** stage = (−x, −y, −z) × scale relative to
-  the OpenXR wrist delta from the T-pose anchor (180°-about-Y plus a Y flip
-  discovered in testing).
-- **Open tuning issues:**
-  1. **Reach over-scales → constant CLAMP.** Calibration scale (≈0.73) came from
-     wrist-to-wrist *span*, which includes shoulder width and overshoots arm
-     length. Live data: a 0.98 m hand move maps past the 0.48 m avatar arm and
-     clamps. A live **IK reach multiplier** (−/+ buttons, `_ik_scale_mult`) was
-     added to dial it down (~0.5–0.6 expected).
-  2. **Elbow pole** hint is a fixed guess `(0,−1,0.5)`; may need tuning.
-  3. **Wrist-rotation/forearm coupling:** wrist rotation uses the forearm rest
-     world rotation as parent; now that the forearm moves via IK, hand rotation
-     can drift when the arm bends — to revisit.
+## A.3 Recently completed / active work
+- **Coordinate-frame fix (insight #1):** arm IK now solves in skeleton-local
+  space via the cached `world_to_skel` transform — ended the long axis saga.
+- **Validated hand feel** (follow ~1.7 cm; wrist = right-multiplied
+  controller-frame offset, forearm-roll routing, no wrist clamp).
+- **Procedural walking** (Route B gait IK) with foot-placement IK, pelvis drop,
+  and foot roll; foot target now lifted during the roll so heel/toe don't clip
+  the floor.
+- **PhysX collision layer** on by default: kinematic proxies (torso elliptic
+  cylinder, head, arm capsules, **palm spheres**) driven from the live SkelQuery
+  joints (insight #2) so they match the skinned mesh and push dynamic objects;
+  torso/head proxies follow the crouch.
+- **Grab** reworked: kinematic handoff while held; only **dynamic rigid bodies**
+  are grabbable (instance proxies / static scenery skipped).
+- **First-person head hide** (region cutout default, head-chop fallback) and an
+  eye forward-offset so the near plane clears the face.
 
-## A.4 Immediate next steps
-1. Lock the IK reach multiplier value, bake it as the default.
-2. Tune elbow pole direction.
-3. Recompute calibration scale from arm length (shoulder→wrist) not wrist span.
-4. Re-couple wrist rotation to the IK-updated forearm world rotation.
+## A.4 Possible next steps
+1. Optical hand-tracking mode for real fingers (controllers off).
+2. Real lower-body tracking via SlimeVR/Vive trackers (the OSC path is stubbed).
+3. Automatic rig retargeting (remove hard-coded `JOINT_MAP` assumptions).
+4. Networked multi-user embodiment.
 
 ## A.5 Known hard constraints (hardware)
-- Quest 2 + controllers = **3 tracked points** (head + 2 hands). Hips/chest are
-  HMD-derived and usable; **elbows/knees/feet from OSC are IK guesses that barely
-  move** — unusable, which is why arms are now driven by OpenXR wrist IK instead.
+- Quest 2 + controllers = **3 tracked points** (head + 2 hands); lower body is
+  inferred (procedural walk / crouch), not tracked.
 - Optical finger tracking and controllers are **mutually exclusive**; with
-  controllers in hand there is no finger-pose data (observed: 0/15 poses).
+  controllers in hand there is no finger-pose data (observed 0/15 poses), hence
+  the procedural finger curl.
 
 ---
 
@@ -96,8 +116,9 @@ References.)*
   Driving a UsdSkel Character from Consumer Headset Tracking.*
 - **Author:** Florian Sponer.
 - **Context:** University project (TU — Institut Setup series).
-- **Artifact:** `avatar.xr.control` Omniverse Kit extension (~1070 LOC, single
-  Python module).
+- **Artifact:** `avatar.xr.control` Omniverse Kit extension (~6,400 LOC; main
+  module + `crouch_sit.py` + tests), plus an optional `machine_interaction`
+  extension.
 - **Suggested figures:** (F1) system data-flow diagram; (F2) coordinate-frame
   comparison (OpenXR vs OSC vs Stage); (F3) UsdSkel joint hierarchy excerpt;
   (F4) 2-bone IK geometry diagram; (F5) screenshots of avatar following user;
@@ -118,8 +139,10 @@ problem), and outcome (working head/torso/hand-rotation + an IK arm prototype).
 - **Goal:** Take a photorealistic Reallusion Character-Creator avatar
   (`F_Business_02`) inside NVIDIA Omniverse and make it mirror the user's real
   movements in real time, viewed first-person in VR.
-- **Scope:** Upper-body embodiment (head, torso lean, arms, hands); fingers and
-  legs scoped out due to hardware limits.
+- **Scope:** Full-body embodiment from 3-point tracking — head, arms (IK), hand
+  orientation, procedural finger curl, procedural walking + crouch for the legs,
+  and a kinematic physics layer for object interaction. Real finger and true
+  lower-body *tracking* remain out of scope (hardware limits).
 - **Contributions:**
   1. A self-contained Kit extension requiring no third-party Python packages.
   2. A documented, reproducible coordinate-frame reconciliation between OpenXR,
@@ -331,11 +354,33 @@ countdown. Useful as a debugging/operator console — worth a screenshot (F6).
    rest data + bone lengths, IK solver, T-pose anchor + scale calibration,
    per-frame `_apply_arm_ik`, live reach-multiplier tuning.
 8. Cleanups: removed dead basis/preset/discovery scaffolding between milestones.
+9. Solved the arm-axis saga (insight #1): solve IK in skeleton-local space via
+   `world_to_skel`; recomputed scale from arm length; validated hand feel.
+10. Added first-person head hide (region cutout, head-chop fallback) + eye offset.
+11. Added the PhysX self-collision layer (analytic torso ellipse + scene-query
+    proxies) to keep arms/hands off the body during IK.
+12. Added procedural walking (Route B gait IK): foot-placement IK, pelvis drop,
+    heel/toe roll, plus a floor-clearance lift so the feet don't clip the ground.
+13. Added crouch & sit (`CrouchSitController`, unit-tested) from HMD height.
+14. Object interaction: kinematic body colliders push dynamic rigid bodies; added
+    per-hand palm colliders; trigger-grab with kinematic handoff.
+15. Collider placement moved to the live SkelQuery joints (insight #2) so the
+    proxies track the skinned mesh; torso/head follow the crouch.
+16. Grab restricted to dynamic rigid bodies (skips instanced/static scenery).
+17. Published to GitHub (`FlorianSponer/Isaac-sim-xr-avatar-control`); bundled an
+    optional example avatar under `examples/avatar/newAva.usd`.
 
 ## File / code reference (for whoever writes the report)
-- Main module: `exts/avatar_xr_control/avatar/xr/control/extension.py` (~1070 LOC).
+- Main module: `exts/avatar_xr_control/avatar/xr/control/extension.py` (~6,400 LOC).
+- Crouch/sit logic: `exts/avatar_xr_control/avatar/xr/control/crouch_sit.py`
+  (+ `tests/test_crouch_sit.py`).
 - Manifest: `exts/avatar_xr_control/config/extension.toml`
-  (deps: `omni.kit.uiapp`, `omni.ui`, `omni.usd`, `omni.kit.xr.core`).
-- Avatar: `Collected_F_Business_02/F_Business_02.usd` (+ textures).
-- Backups: `backups/extension_*_pre_ik.py` (pre-IK working snapshot).
-- Calibration debug output: `_calib_debug.txt`.
+  (deps: `omni.kit.uiapp`, `omni.ui`, `omni.usd`, `omni.kit.xr.core`, `omni.physx`).
+- Optional second extension: `exts/machine_interaction/` (finger-press triggers
+  machine animations).
+- GitHub repo: https://github.com/FlorianSponer/Isaac-sim-xr-avatar-control
+- Example avatar: `examples/avatar/newAva.usd` (UV-grid placeholder material).
+- Working avatar asset: `Collected_F_Business_02/F_Business_02.usd` (+ textures;
+  not committed — large).
+- Backups: `backups/extension_*.py`.
+- Debug dumps: `_calib_debug.txt`, `_grab_debug.txt`, `_follow_debug.txt`, etc.
