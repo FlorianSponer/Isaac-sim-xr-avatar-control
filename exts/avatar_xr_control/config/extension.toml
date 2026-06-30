@@ -11,6 +11,7 @@ authors = ["Institut Setup"]
 "omni.ui" = {}
 "omni.usd" = {}
 "omni.kit.xr.core" = {}
+"omni.physx" = {}
 
 [[python.module]]
 name = "avatar.xr.control"

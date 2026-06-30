@@ -14,3 +14,20 @@ _*.txt
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Large avatar assets / scenes (not versioned)
+/Collected_F_Business_02/
+/backups/
+/Abgabe/
+*.code-workspace
+
+# USD scenes & assets (do not commit)
+*.usd
+*.usda
+*.usdc
+*.usdz
+
+# Additional runtime debug / capture dumps
+_*.csv
+_*.jsonl
+_*.json

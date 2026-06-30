@@ -1,0 +1,13 @@
+[package]
+title = "Machine Interaction"
+version = "1.0.0"
+description = "Avatar finger-press interactions on machine parts (switches trigger animations)."
+category = "Simulation"
+keywords = ["machine", "interaction", "switch", "animation", "vr", "xr"]
+authors = ["Institut Setup"]
+
+[dependencies]
+"omni.usd" = {}
+
+[[python.module]]
+name = "machine.interaction"
