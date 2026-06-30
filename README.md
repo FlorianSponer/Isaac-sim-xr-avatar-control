@@ -9,14 +9,24 @@ in real time from a VR headset and its controllers:
 - **Hand rotation** — controller orientation drives the wrists, aligned via a
   one-time T-pose calibration (facing direction does not matter).
 - **First-person camera coupling** — the avatar is pinned to the headset every
-  frame (camera position and view direction), with the eye-level viewpoint and
-  the avatar's head mesh hidden while tracking ("head chop") so it never blocks
-  the view. Looking down shows your own body.
+  frame (camera position and view direction), at eye level. The head region is
+  hidden while tracking (non-deforming mesh/material cutout, with a joint-scale
+  "head chop" fallback) so it never blocks the view. Looking down shows your
+  own body.
 - **Locomotion** — the right thumbstick moves the XR camera rig (move where you
   look); the avatar follows automatically. Physical walking and turning work
   the same way.
-- **Grabbing** — hold the trigger near a configured object to pick it up,
-  release the trigger to place it precisely.
+- **Procedural walking** — when the avatar travels, a synthesized stepping gait
+  drives the legs (foot-placement IK with ground contact, pelvis drop, and
+  heel/toe roll). No leg trackers required.
+- **Crouch & sit** — inferred from headset height; the legs bend and the body
+  lowers to follow, again with no leg trackers.
+- **Physics interaction** — kinematic collider proxies track the posed avatar
+  (torso, head, arms, palms) so the body and hands push dynamic rigid-body
+  objects in the scene.
+- **Grabbing** — hold the trigger near a configured **dynamic rigid-body**
+  object to pick it up, release the trigger to place it precisely. Static
+  scenery is never grabbed.
 - **Smoothing** — One Euro filtering on all tracked positions, tunable at
   runtime.
 
@@ -24,10 +34,14 @@ in real time from a VR headset and its controllers:
 
 | Path | Description |
 |---|---|
-| `exts/avatar_xr_control/` | The Kit extension (`avatar.xr.control`) |
+| `exts/avatar_xr_control/` | The main Kit extension (`avatar.xr.control`) |
+| `exts/machine_interaction/` | Optional extension: finger-press triggers machine animations |
+| `examples/avatar/` | Optional bundled sample avatar (`newAva.usd`) |
 
-No avatar is bundled — the extension works with standard Reallusion-rigged USD
-characters such as those shipped with NVIDIA's asset packs (see step 5).
+A small example avatar is bundled under `examples/avatar/newAva.usd` (a sample
+UsdSkel character with a UV-grid placeholder material). The extension also works
+with any standard Reallusion-rigged USD character such as those shipped with
+NVIDIA's asset packs (see step 5).
 
 ## Requirements
 
@@ -77,8 +91,9 @@ The extension automatically requests the **VR** profile when starting.
 
 ### 5. Add a standard USD avatar to a stage
 
-The extension drives any **Reallusion Character Creator** rig (joint naming
-`RL_BoneRoot/Hip/Waist/Spine01/...`). The characters from NVIDIA's standard
+To try it quickly, reference the bundled `examples/avatar/newAva.usd` into a
+stage. For your own character, the extension drives any **Reallusion Character
+Creator** rig (joint naming `RL_BoneRoot/Hip/Waist/Spine01/...`). The characters from NVIDIA's standard
 asset/template packs use exactly this rig — for example **F_Business_02**
 ("female adult business"), found in the Isaac Sim asset browser under
 *People/Characters* (the characters also used by `omni.anim.people`).
@@ -132,8 +147,11 @@ in the **Grab** panel.
 ## Runtime tuning (UI panels)
 
 - **XR Session** — re-center the view to the avatar's eyes, toggle head
-  visibility, adjust eye height.
-- **Locomotion** — camera follow on/off, body turn rate, stick glide on/off.
+  visibility, adjust eye height and forward offset.
+- **Locomotion** — camera follow on/off, body turn rate, stick glide on/off,
+  procedural walk toggle.
+- **Physics** — body-collision layer on/off, grab enable + grabbable prim
+  paths, torso collider size/placement, collision-shape debug view.
 - **Tuning (advanced)** — IK reach multiplier, elbow pole weights, smoothing
   (jitter/lag).
 
