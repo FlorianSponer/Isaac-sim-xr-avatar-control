@@ -34,3 +34,6 @@ _*.json
 
 # ...except the bundled example avatar
 !/examples/avatar/newAva.usd
+
+# Keep PROGRESS notes local only
+PROGRESS.md
