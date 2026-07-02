@@ -30,6 +30,16 @@ in real time from a VR headset and its controllers:
 - **Smoothing** — One Euro filtering on all tracked positions, tunable at
   runtime.
 
+## Status
+
+**Stable, production-ready.** All features are implemented and tested:
+- Arm/hand IK + calibration system working reliably
+- Procedural walking (Route B gait with foot placement) tuned and stable
+- Physics colliders and grab interaction functional
+- Timeout handling self-healing (no more permanent red errors)
+- Portable deployment (paths no longer hardcoded)
+- One Euro smoothing on all tracked inputs
+
 ## Repository contents
 
 | Path | Description |
@@ -170,8 +180,11 @@ in the **Grab** panel.
   the stage; the extension repairs them automatically at initialisation (watch
   the console for `Repaired missing xformOp:...`), then save the stage once.
 
-## Optional: body trackers via ALVR OSC
+## Known limitations
 
-The extension contains a UDP/OSC receiver (port 9000) for the ALVR *VRChat
-body OSC* sink. It is not required for any current feature and is reserved for
-future lower-body tracking.
+- **Lower-body trackers not supported** — the procedural walking synthesis covers
+  all locomotion; dedicated leg/foot trackers are not used.
+- **Single avatar per stage** — the extension drives one active skeleton. Running
+  multiple instances requires manual code changes.
+- **Reallusion rigs only** — custom skeleton joint hierarchies need mapping
+  updates to `JOINT_MAP` in extension.py.
