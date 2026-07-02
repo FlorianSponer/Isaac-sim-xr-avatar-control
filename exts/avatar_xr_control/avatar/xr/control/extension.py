@@ -2,9 +2,6 @@ import asyncio
 import json
 import math
 import os
-import socket
-import struct
-import threading
 import time
 
 import omni.ext
@@ -27,6 +24,43 @@ except Exception as _e:               # pragma: no cover - depends on runtime
     get_physx_interface = None
     _PHYS_AVAILABLE = False
     print(f"[avatar_xr_control] omni.physx unavailable; physics collision off: {_e}")
+
+# ---------------------------------------------------------------------------
+# Data directory — calibration, recordings and diagnostic dumps live here.
+# Overridable via AVATAR_XR_DATA_DIR; falls back to the historical project
+# folder when present (dev machine), else a per-user folder, so calibration
+# persistence works on any deployment target.
+# ---------------------------------------------------------------------------
+
+_LEGACY_DATA_DIR = r"c:\World\Institut_Setup3"
+
+
+def _resolve_data_dir():
+    d = os.environ.get("AVATAR_XR_DATA_DIR")
+    if not d:
+        d = (_LEGACY_DATA_DIR if os.path.isdir(_LEGACY_DATA_DIR)
+             else os.path.join(os.path.expanduser("~"), "avatar_xr_control"))
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception as e:
+        print(f"[avatar_xr_control] data dir '{d}' unavailable ({e}); "
+              f"falling back to cwd")
+        d = os.getcwd()
+    return d
+
+
+DATA_DIR = _resolve_data_dir()
+
+
+def _data_path(name):
+    return os.path.join(DATA_DIR, name)
+
+
+# Per-frame diagnostic file dumps (_armvec_debug / _follow_debug /
+# _rest_world_debug). Development aids — off unless explicitly enabled, so a
+# deployed build doesn't write to disk every second.
+DEBUG_FILES = os.environ.get("AVATAR_XR_DEBUG_FILES", "0").lower() in (
+    "1", "true", "on")
 
 DEFAULT_SKEL_PATH = (
     "/Root/female_adult_business_02/ManRoot/female_adult_business_02"
@@ -503,126 +537,6 @@ def _correct_xr_quat(quatd) -> Gf.Quatf:
 
 
 # ---------------------------------------------------------------------------
-# Body OSC receiver (pure socket, no dependencies)
-# ---------------------------------------------------------------------------
-
-# Tracker IDs 1-8 from ALVR VRChat OSC sink
-_BODY_TRACKER_MAP = {
-    "head":  "head",
-    "1":     "hip",
-    "2":     "chest",
-    "3":     "left_foot",
-    "4":     "right_foot",
-    "5":     "left_knee",
-    "6":     "right_knee",
-    "7":     "left_elbow",
-    "8":     "right_elbow",
-}
-
-
-def _parse_osc(data: bytes):
-    """Parse a minimal OSC message. Returns (address, [float, ...]) or None."""
-    try:
-        addr_end = data.index(b'\x00')
-        address  = data[:addr_end].decode('utf-8')
-        tag_start = (addr_end + 4) & ~3
-        tag_end   = data.index(b'\x00', tag_start)
-        tags      = data[tag_start + 1:tag_end].decode('utf-8')
-        val_start = (tag_end + 4) & ~3
-        values = []
-        for t in tags:
-            if t == 'f':
-                values.append(struct.unpack('>f', data[val_start:val_start + 4])[0])
-                val_start += 4
-        return address, values
-    except Exception:
-        return None, None
-
-
-class BodyOscReceiver:
-    def __init__(self, port: int = 9000):
-        self._positions = {name: Gf.Vec3f(0, 0, 0) for name in _BODY_TRACKER_MAP.values()}
-        self._lock = threading.Lock()
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("0.0.0.0", port))
-        self._sock.settimeout(0.5)
-        self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        print(f"[BodyOscReceiver] Listening on UDP port {port}")
-
-    def _run(self):
-        while self._running:
-            try:
-                data, _ = self._sock.recvfrom(4096)
-                address, values = _parse_osc(data)
-                if address is None or not address.endswith("/position") or len(values) < 3:
-                    continue
-                parts = address.split("/")
-                if len(parts) < 5:
-                    continue
-                token = parts[3]
-                joint = _BODY_TRACKER_MAP.get(token)
-                if joint is None:
-                    continue
-                # ALVR OSC: X+ right, Y+ up, Z+ forward (Unity).
-                # Avatar faces -Z in stage, so ALVR forward (+Z) = stage backward.
-                # Negate Z to convert ALVR forward into stage forward (-Z).
-                # X stays the same: ALVR right (+X) = stage right (+X).
-                x  =  values[0]
-                y  =  values[1]
-                z  = -values[2]
-                with self._lock:
-                    self._positions[joint] = Gf.Vec3f(x, y, z)
-            except socket.timeout:
-                continue
-            except Exception:
-                continue
-
-    def get_position(self, joint: str) -> Gf.Vec3f:
-        with self._lock:
-            return self._positions.get(joint, Gf.Vec3f(0, 0, 0))
-
-    def stop(self):
-        self._running = False
-        self._sock.close()
-
-
-# ---------------------------------------------------------------------------
-# Kinematic colliders for avatar interaction
-# ---------------------------------------------------------------------------
-
-def _add_capsule_collider(stage, prim_path, radius=0.05, length=0.3):
-    """Add a capsule collider to a bone prim. Kinematic (no physics simulation)."""
-    prim = stage.GetPrimAtPath(prim_path)
-    if not prim.IsValid():
-        return
-    try:
-        collision_api = UsdPhysics.CollisionAPI.Apply(prim)
-        collision_api.CreateCollisionEnabledAttr().Set(True)
-        geom = UsdGeom.Capsule.Define(stage, prim_path + "/collider")
-        geom.CreateRadiusAttr().Set(radius)
-        geom.CreateHeightAttr().Set(length)
-    except Exception as e:
-        print(f"[avatar_xr_control] Failed to add capsule collider to {prim_path}: {e}")
-
-
-def _add_box_collider(stage, prim_path, size=(0.2, 0.3, 0.15)):
-    """Add a box collider to a bone prim. Kinematic (no physics simulation)."""
-    prim = stage.GetPrimAtPath(prim_path)
-    if not prim.IsValid():
-        return
-    try:
-        collision_api = UsdPhysics.CollisionAPI.Apply(prim)
-        collision_api.CreateCollisionEnabledAttr().Set(True)
-        geom = UsdGeom.Cube.Define(stage, prim_path + "/collider")
-        geom.CreateExtentAttr().Set(size)
-    except Exception as e:
-        print(f"[avatar_xr_control] Failed to add box collider to {prim_path}: {e}")
-
-
-# ---------------------------------------------------------------------------
 # Skeleton wrapper
 # ---------------------------------------------------------------------------
 
@@ -715,6 +629,11 @@ class _AvatarSkel:
         self._rotations    = rotations
         self._scales       = scales
         self._translations = translations   # mutated by the pelvis-drop (legs)
+        # Deferred-write state: while the tracking loop runs, joint writes only
+        # mutate the arrays above and flush() pushes them to USD once per frame.
+        self._defer        = False
+        self._rot_dirty    = False
+        self._trans_dirty  = False
 
         # TRUE-WORLD joint transforms via the canonical UsdSkel query. This is
         # render-faithful — it composes the full transform stack (rest pose +
@@ -1091,35 +1010,40 @@ class _AvatarSkel:
               f"{len(self._head_subsets)} subsets, face_covered={face_covered}"
               f"{'' if self._head_region_ok else '  → head-chop fallback'}")
 
-        self._setup_colliders(stage, skel_path)
-
         print(f"[avatar_xr_control] Setup OK — {len(joints)} joints")
-
-    def _setup_colliders(self, stage, skel_path):
-        """Add kinematic colliders to skeleton bones for environmental interaction."""
-        try:
-            # Arm colliders: larger capsules for effective environment interaction
-            # Right arm
-            _add_capsule_collider(stage, JOINT_MAP["r_upperarm"], radius=0.07, length=0.40)
-            _add_capsule_collider(stage, JOINT_MAP["r_forearm"], radius=0.06, length=0.35)
-            # Left arm
-            _add_capsule_collider(stage, JOINT_MAP["l_upperarm"], radius=0.07, length=0.40)
-            _add_capsule_collider(stage, JOINT_MAP["l_forearm"], radius=0.06, length=0.35)
-
-            # Torso collider: larger box for robust body interaction
-            _add_box_collider(stage, JOINT_MAP["waist"], size=(0.25, 0.45, 0.18))
-
-            print("[avatar_xr_control] Kinematic colliders added to avatar")
-        except Exception as e:
-            print(f"[avatar_xr_control] Collider setup warning: {e}")
 
     def write_joint_rotation(self, idx: int, quatf: Gf.Quatf):
         self._rotations[idx] = quatf
-        self.anim.GetRotationsAttr().Set(Vt.QuatfArray(self._rotations))
+        if self._defer:
+            self._rot_dirty = True
+        else:
+            self.anim.GetRotationsAttr().Set(Vt.QuatfArray(self._rotations))
 
     def write_joint_translation(self, idx: int, vec: Gf.Vec3f):
         self._translations[idx] = vec
-        self.anim.GetTranslationsAttr().Set(Vt.Vec3fArray(self._translations))
+        if self._defer:
+            self._trans_dirty = True
+        else:
+            self.anim.GetTranslationsAttr().Set(Vt.Vec3fArray(self._translations))
+
+    def set_deferred(self, on: bool):
+        """Batch mode for the tracking loop: a tracked frame makes ~40-50 joint
+        writes (arms, hands, 30 finger joints, legs, head), and each immediate
+        write serialises the FULL joint array into USD and triggers change
+        processing. Deferred, the writes collapse into one Set per attribute per
+        frame via flush(). Turning batching off flushes pending writes, so
+        immediate-write semantics are restored for UI callbacks."""
+        self._defer = bool(on)
+        if not on:
+            self.flush()
+
+    def flush(self):
+        if self._rot_dirty:
+            self._rot_dirty = False
+            self.anim.GetRotationsAttr().Set(Vt.QuatfArray(self._rotations))
+        if self._trans_dirty:
+            self._trans_dirty = False
+            self.anim.GetTranslationsAttr().Set(Vt.Vec3fArray(self._translations))
 
     def joint_world_positions(self):
         """LIVE world positions of every joint (indexed by joint index),
@@ -1277,62 +1201,6 @@ def _swing_to_local(rest_dir_w, target_dir_w, bone_rest_w,
     return local, bone_world_live
 
 
-_GRIP_DIAG_DONE = False
-
-def _dump_grip_gestures(device):
-    """One-shot: write all available input gestures on the device to a file."""
-    global _GRIP_DIAG_DONE
-    if _GRIP_DIAG_DONE or device is None:
-        return
-    _GRIP_DIAG_DONE = True
-    _COMPONENTS = (
-        "trigger", "squeeze", "grip", "select", "pinch",
-        "thumbstick", "joystick", "trackpad", "stick",
-        "a", "b", "x", "y", "menu", "system",
-    )
-    _GESTURES = ("value", "click", "touch", "force", "ready", "pose")
-    lines = ["=== Available input gestures (right controller) ==="]
-    for comp in _COMPONENTS:
-        found = []
-        for gest in _GESTURES:
-            try:
-                if device.has_input_gesture(comp, gest):
-                    try:
-                        val = device.get_input_gesture_value(comp, gest)
-                        found.append(f"{gest}={val:.3f}")
-                    except Exception:
-                        found.append(gest)
-            except Exception:
-                pass
-        if found:
-            lines.append(f"  {comp}: {', '.join(found)}")
-    try:
-        with open(r"c:\World\Institut_Setup3\_grip_gestures.txt", "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-    except Exception:
-        pass
-
-
-def _grip_value(device):
-    """Return the strongest 'grab' input on an XR controller as 0..1."""
-    if device is None:
-        return 0.0
-    _dump_grip_gestures(device)
-    best = 0.0
-    _COMPS   = ("trigger", "squeeze", "grip", "select", "pinch")
-    _GESTS   = ("value", "click", "force", "touch")
-    for comp in _COMPS:
-        for gesture in _GESTS:
-            try:
-                if device.has_input_gesture(comp, gesture):
-                    v = float(device.get_input_gesture_value(comp, gesture))
-                    if v > best:
-                        best = v
-            except Exception:
-                pass
-    return best
-
-
 def _trigger_value(device):
     """Return the controller trigger as 0..1 (index-finger driver), or 0.0."""
     if device is None:
@@ -1351,8 +1219,8 @@ def _trigger_value(device):
 
 def _squeeze_value(device):
     """Return the controller grip/squeeze as 0..1 (the fist driver), or 0.0.
-    Separate from _grip_value (which also folds in trigger/pinch) so the index
-    finger can track the trigger independently of the other fingers."""
+    Kept separate from the trigger so the index finger can track the trigger
+    independently of the other fingers."""
     if device is None:
         return 0.0
     best = 0.0
@@ -1483,10 +1351,11 @@ class AvatarXRControlExtension(omni.ext.IExt):
                                   # clamped; far reaches now extend via clav follow)
         self._ik_enabled = False
         self._armvec_tick = 0
-        try:
-            open(r"c:\World\Institut_Setup3\_armvec_debug.txt", "w").close()
-        except Exception:
-            pass
+        if DEBUG_FILES:
+            try:
+                open(_data_path("_armvec_debug.txt"), "w").close()
+            except Exception:
+                pass
         # Elbow pole bias. Down dominates so elbows hang down like a relaxed
         # human arm for the common reaches; outward (per-arm) + back keep the
         # elbow off the torso. With kinematic colliders, very strong outward bias
@@ -1627,7 +1496,6 @@ class AvatarXRControlExtension(omni.ext.IExt):
         self._filt_rrot  = QuatOneEuro(self._rot_cutoff, self._rot_beta)
         self._filt_lrot  = QuatOneEuro(self._rot_cutoff, self._rot_beta)
 
-        self._body_osc       = BodyOscReceiver(port=9000)
         self._xr_cam_path    = "/_xr/stage/xrCamera"
 
         # Measured per-frame time (s), updated in _tracking_loop. All exponential
@@ -1650,7 +1518,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
         # then replay it (no headset) to fine-tune the IK against real motion. The
         # recording's first line is a calibration snapshot so replay reproduces the
         # same hand→avatar mapping; tuning params stay live so they can be adjusted.
-        self._rec_path        = r"c:\World\Institut_Setup3\_xr_recording.jsonl"
+        self._rec_path        = _data_path("_xr_recording.jsonl")
         self._rec_enabled     = False
         self._rec_file        = None
         self._rec_t0          = 0.0
@@ -1660,10 +1528,11 @@ class AvatarXRControlExtension(omni.ext.IExt):
         self._play_idx        = 0
         self._play_loop       = True
         self._play_saved_devs = None
+        self._live_calib      = None      # live calibration stashed during replay
         self._play_prev_t     = None      # recorded timestamp of the last replayed frame
         self._play_started_loop = False   # replay started the loop (offline) → stop it
         self._replay_capturing = False    # a replay-metrics capture is running
-        self._replay_capture_path = r"c:\World\Institut_Setup3\_replay_capture.csv"
+        self._replay_capture_path = _data_path("_replay_capture.csv")
 
         # Locomotion: the right thumbstick moves the XR ORIGIN (camera rig);
         # the avatar follows the camera via _apply_camera_follow. Step in metres.
@@ -1736,24 +1605,10 @@ class AvatarXRControlExtension(omni.ext.IExt):
         # True = legacy joint-scale 'head chop' fallback.
         self._head_chop_fallback = False
 
-        # --- Grab (level-2 object interaction) ---
-        # Button grab: hold the controller trigger (or grip) while the hand is
-        # near an object to pick it up; release the button to set it down. This
-        # allows precise placement (unlike the old flick-release).
-        self._grab_enabled   = False
-        self._grab_radius    = 0.18   # metres: grab point must be this close to grab
-        self._grab_threshold = 0.4    # trigger/grip value above which = "pressed"
-        # The grab reference is the PALM, not the wrist joint: wrist extended toward
-        # the fingers by this much. Measuring from the wrist made grabs hard to
-        # start (wrist sits ~10 cm behind the hand) and the held object float out
-        # past the hand mesh (it kept a wrist-relative offset).
+        # Palm reference point: wrist extended toward the fingers by this much.
+        # Still used to place the palm PHYSICS collider (the in-extension grab UI
+        # was removed as redundant; grabbing is handled elsewhere).
         self._grab_reach     = 0.09   # metres wrist→palm along the hand direction
-        self._grab_candidates = []    # list of prim paths typed in UI
-        self._grabbed = {True: None, False: None}   # is_right -> prim path or None
-        self._grab_offset = {True: None, False: None}  # hand→object offset at grab
-        # Saved kinematicEnabled of a held dynamic body — restored on release so the
-        # USD-driven follow doesn't fight PhysX while held, then gravity resumes.
-        self._grab_prev_kin = {True: None, False: None}
         self._hand_world  = {True: None, False: None}  # current hand world pos
         # Live forearm world rotation from the IK each frame — used as the hand's
         # parent frame so hand orientation tracks the arm (not just the T-pose).
@@ -1807,17 +1662,20 @@ class AvatarXRControlExtension(omni.ext.IExt):
         self._stage_sub = omni.usd.get_context().get_stage_event_stream().create_subscription_to_pop(
             self._on_stage_event, name="avatar_xr_control.stage"
         )
-        asyncio.ensure_future(self._deferred_init())
+        self._init_task = asyncio.ensure_future(self._deferred_init())
 
     def on_shutdown(self):
+        if getattr(self, "_init_task", None) is not None:
+            self._init_task.cancel()
+            self._init_task = None
         self._stop_tracking()
         self._phys_stop_sim()
-        if self._body_osc:
-            self._body_osc.stop()
         self._stage_sub = None
         self._skel      = None
-        if self._window:
-            self._window.destroy()
+        # getattr-guarded: if on_startup failed partway, _window may not exist.
+        window = getattr(self, "_window", None)
+        if window:
+            window.destroy()
             self._window = None
 
     # ------------------------------------------------------------------
@@ -1832,13 +1690,26 @@ class AvatarXRControlExtension(omni.ext.IExt):
                 self._try_init(stage)
 
     async def _deferred_init(self):
-        for _ in range(300):
+        """Wait for the skeleton prim to appear, then initialise. Fast polling
+        covers the common case (stage already open); a slow indefinite retry
+        follows so a heavy/Nucleus-streamed stage that takes longer to compose
+        its referenced assets doesn't leave the extension permanently stuck on
+        a red timeout — it self-heals whenever the prim shows up, including
+        after a later stage reopen (self._skel is reset to None then)."""
+        for _ in range(300):                      # ~5s at 16ms
             stage = omni.usd.get_context().get_stage()
             if stage and stage.GetPrimAtPath(self._skel_path).IsValid():
                 self._try_init(stage)
                 return
             await asyncio.sleep(0.016)
-        self._set_status("Timeout: Skeleton not found", error=True)
+        self._set_status(
+            f"Waiting for skeleton at {self._skel_path} ...", error=False)
+        while True:
+            stage = omni.usd.get_context().get_stage()
+            if stage and stage.GetPrimAtPath(self._skel_path).IsValid():
+                self._try_init(stage)
+                return
+            await asyncio.sleep(2.0)
 
     def _try_init(self, stage):
         if self._skel is not None:
@@ -2647,7 +2518,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
         positions + arm directions to a file so the user can confirm the rest
         arm now reads sideways (world ±X), matching the visible T-pose."""
         sk = self._skel
-        if sk is None:
+        if sk is None or not DEBUG_FILES:
             return
         def fv(v):
             return f"({v[0]:+.3f}, {v[1]:+.3f}, {v[2]:+.3f})"
@@ -2678,7 +2549,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
                 f"L wrist    = {fv(l_wr)}",
                 f"L shoulder->elbow dir = {fv(l_dir)}   (expect ~world -X for T-pose)",
             ]
-            with open(r"c:\World\Institut_Setup3\_rest_world_debug.txt",
+            with open(_data_path("_rest_world_debug.txt"),
                       "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
         except Exception as e:
@@ -2687,12 +2558,15 @@ class AvatarXRControlExtension(omni.ext.IExt):
     def _apply_skel_path(self):
         self._skel_path = self._skel_path_field.model.get_value_as_string().strip()
         self._skel = None
-        self._set_status("Reinitialising…", error=False)
+        self._set_status("Reinitialising...", error=False)
+        if getattr(self, "_init_task", None) is not None:
+            self._init_task.cancel()
+            self._init_task = None
         stage = omni.usd.get_context().get_stage()
         if stage:
             self._try_init(stage)
         else:
-            asyncio.ensure_future(self._deferred_init())
+            self._init_task = asyncio.ensure_future(self._deferred_init())
 
     def _init_xr(self):
         try:
@@ -2776,19 +2650,6 @@ class AvatarXRControlExtension(omni.ext.IExt):
                                   height=24, style=BTN,
                                   tooltip="Put controllers DOWN first. Writes _finger_diag.txt")
 
-                # --- GRAB ------------------------------------------------------
-                with ui.CollapsableFrame("Grab", collapsed=False, style=FRAME):
-                    with ui.VStack(spacing=4, height=0):
-                        ui.Label("Grabbable prim paths (comma-separated):",
-                                 height=14, style=S_LABEL)
-                        self._grab_field = ui.StringField(height=22, style={"font_size": 10})
-                        self._grab_field.model.set_value("/World/Cube")
-                        with ui.HStack(spacing=6, height=24):
-                            ui.Button("Enable grab", clicked_fn=self._enable_grab, style=BTN)
-                            ui.Button("Disable grab", clicked_fn=self._disable_grab, style=BTN)
-                        self._grab_lbl = ui.Label(
-                            "grab: off (hold trigger near object)", height=16, style=S_LABEL)
-
                 # --- LOCOMOTION ------------------------------------------------
                 with ui.CollapsableFrame("Locomotion", collapsed=True, style=FRAME):
                     with ui.VStack(spacing=4, height=0):
@@ -2845,15 +2706,6 @@ class AvatarXRControlExtension(omni.ext.IExt):
                             ui.Button("Right >", clicked_fn=self._move_right, style=BTN)
                         ui.Button("Back", clicked_fn=self._move_back, height=24, style=BTN)
 
-                # --- MACHINE (timeline animation trigger) ----------------------
-                with ui.CollapsableFrame("Machine", collapsed=False, style=FRAME):
-                    with ui.VStack(spacing=4, height=0):
-                        ui.Button("Play / Stop door", height=28,
-                                  clicked_fn=self._toggle_machine_anim, style=BTN,
-                                  tooltip="Start/stop the machine timeline animation")
-                        self._machine_lbl = ui.Label("", height=16, style=S_LABEL)
-                        self._update_machine_lbl()
-
                 # --- AVATAR PATH (setup, collapsed) ----------------------------
                 with ui.CollapsableFrame("Avatar Path", collapsed=True, style=FRAME):
                     with ui.VStack(spacing=4, height=0):
@@ -2873,7 +2725,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
                 # --- INPUT SIMULATION (testing, collapsed) ----------------------
                 with ui.CollapsableFrame("Input Simulation", collapsed=True, style=FRAME):
                     with ui.VStack(spacing=4, height=0):
-                        ui.Button("▶ Run debug capture (auto)", height=28, style=BTN,
+                        ui.Button("Run debug capture (auto)", height=28, style=BTN,
                                   clicked_fn=self._start_debug_capture,
                                   tooltip="One click: enables simulation, steps the avatar through every test pose, and writes a CSV comparing the simulated controller target vs. the resulting avatar joint positions. No manual toggling or visual inspection needed.")
                         self._debug_cap_lbl = ui.Label("", height=16, style=S_LABEL)
@@ -2913,19 +2765,19 @@ class AvatarXRControlExtension(omni.ext.IExt):
                                  "to fine-tune the IK against real motion.",
                                  height=28, style=S_LABEL)
                         with ui.HStack(spacing=6, height=24):
-                            ui.Button("● Record live", clicked_fn=self._start_recording,
+                            ui.Button("Record live", clicked_fn=self._start_recording,
                                       style=BTN,
                                       tooltip="Start XR first, then record raw head/controller/finger data each frame")
-                            ui.Button("■ Stop", clicked_fn=self._stop_recording, style=BTN)
+                            ui.Button("Stop", clicked_fn=self._stop_recording, style=BTN)
                         with ui.HStack(spacing=6, height=24):
-                            ui.Button("▶ Replay", clicked_fn=self._start_replay, style=BTN,
+                            ui.Button("Replay", clicked_fn=self._start_replay, style=BTN,
                                       tooltip="Play the recording through the avatar; tweak tuning while it loops")
-                            ui.Button("■ Stop", clicked_fn=self._stop_replay, style=BTN)
+                            ui.Button("Stop", clicked_fn=self._stop_replay, style=BTN)
                             ui.Button("Loop on/off", clicked_fn=self._toggle_play_loop,
                                       style=BTN)
-                        ui.Button("▶ Replay + capture metrics", clicked_fn=self._start_replay_capture,
+                        ui.Button("Replay + capture metrics", clicked_fn=self._start_replay_capture,
                                   style=BTN,
-                                  tooltip="Step the recording through the IK and write follow-error / reach / clip stats for your REAL motion → _replay_capture.csv")
+                                  tooltip="Step the recording through the IK and write follow-error / reach / clip stats for your REAL motion -> _replay_capture.csv")
                         self._capture_lbl = ui.Label("", height=16, style=S_LABEL)
                         self._update_capture_lbl()
 
@@ -2948,11 +2800,11 @@ class AvatarXRControlExtension(omni.ext.IExt):
 
     def _ik_scale_up(self):
         self._ik_scale_mult = min(3.0, self._ik_scale_mult + 0.1)
-        self._ik_scale_lbl.text = f"IK reach mult: {self._ik_scale_mult:.2f}"
+        self._set_lbl("_ik_scale_lbl", f"IK reach mult: {self._ik_scale_mult:.2f}")
 
     def _ik_scale_down(self):
         self._ik_scale_mult = max(0.1, self._ik_scale_mult - 0.1)
-        self._ik_scale_lbl.text = f"IK reach mult: {self._ik_scale_mult:.2f}"
+        self._set_lbl("_ik_scale_lbl", f"IK reach mult: {self._ik_scale_mult:.2f}")
 
     # ------------------------------------------------------------------
     # Locomotion — translate the avatar root prim through the stage
@@ -2990,29 +2842,13 @@ class AvatarXRControlExtension(omni.ext.IExt):
                 f"root pos=({cur[0]+dx:.2f}, {cur[1]+dy:.2f}, {cur[2]+dz:.2f})",
                 0xFF44FF44)
 
-    def _enable_grab(self):
-        raw = self._grab_field.model.get_value_as_string()
-        self._grab_candidates = [p.strip() for p in raw.split(",") if p.strip()]
-        self._grab_enabled = True
-        self._grab_lbl.text = f"grab: ON ({len(self._grab_candidates)} objs)"
-        self._grab_lbl.style = {"font_size": 11, "color": 0xFF44FF44}
-
-    def _disable_grab(self):
-        self._grab_enabled = False
-        # Drop any held objects cleanly so they don't stay frozen (kinematic).
-        stage = omni.usd.get_context().get_stage()
-        for is_right in (True, False):
-            self._release_grab(stage, is_right)
-        self._grab_lbl.text = "grab: off"
-        self._grab_lbl.style = {"font_size": 11, "color": 0xFFCCCCCC}
-
     def _step_origin(self, dx=0.0, dz=0.0):
         """Manual step: move the XR origin (camera rig) camera-relative.
         The avatar follows the camera via _apply_camera_follow."""
         if self._xr is None:
             ok, _ = self._init_xr()
             if not ok:
-                self._set_track("no XR session — manual step needs XR", 0xFFFFAA33)
+                self._set_track("no XR session - manual step needs XR", 0xFFFFAA33)
                 return
         try:
             self._xr.schedule_move_space_origin_relative_to_camera(dx, 0.0, dz)
@@ -3102,32 +2938,6 @@ class AvatarXRControlExtension(omni.ext.IExt):
     def _update_legs_lbl(self):
         state = "ON" if self._legs_on else "OFF"
         self._legs_lbl.text = f"procedural walk (legs): {state}"
-
-    # --- Machine animation (stage timeline) ---------------------------------
-    def _update_machine_lbl(self):
-        try:
-            import omni.timeline
-            playing = omni.timeline.get_timeline_interface().is_playing()
-        except Exception:
-            playing = False
-        self._machine_lbl.text = f"machine animation: {'playing' if playing else 'stopped'}"
-
-    def _toggle_machine_anim(self):
-        """Start/stop the stage timeline that drives the machine (door) animation.
-        The animation itself is authored as keyframed translates on the door
-        meshes; playing the timeline advances it."""
-        try:
-            import omni.timeline
-            tl = omni.timeline.get_timeline_interface()
-            if tl.is_playing():
-                tl.stop()
-            else:
-                tl.set_looping(True)
-                tl.play()
-        except Exception as e:
-            self._machine_lbl.text = f"machine anim error: {e}"
-            return
-        self._update_machine_lbl()
 
     def _toggle_legs(self):
         self._legs_on = not self._legs_on
@@ -3536,14 +3346,14 @@ class AvatarXRControlExtension(omni.ext.IExt):
         follow_op.Set(math.degrees(yaw))
 
         self._follow_tick += 1
-        if self._follow_tick % 60 == 0:
+        if DEBUG_FILES and self._follow_tick % 60 == 0:
             try:
                 # Live eye via the full matrix path — must match cam in XZ.
                 eye_rest = Gf.Vec3f(float(sk.head_rest_world[0]),
                                     float(sk.head_rest_world[1]) + self._eye_up,
                                     float(sk.head_rest_world[2]) - self._eye_fwd)
                 live_eye = self._rest_to_world(eye_rest)
-                with open(r"c:\World\Institut_Setup3\_follow_debug.txt",
+                with open(_data_path("_follow_debug.txt"),
                           "w", encoding="utf-8") as f:
                     f.write(
                         f"cam=({cam[0]:+.3f},{cam[1]:+.3f},{cam[2]:+.3f})  "
@@ -3562,7 +3372,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
                 pass
 
     def _update_pole_lbl(self):
-        self._pole_lbl.text = (
+        self._set_lbl("_pole_lbl",
             f"elbow pole: down {self._pole_down:.1f} back {self._pole_back:.1f}")
 
     def _pole_down_up(self):
@@ -3584,7 +3394,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
     # --- Clavicle / shoulder-follow controls ---
     def _update_clav_lbl(self):
         state = "ON" if self._clav_follow else "OFF"
-        self._clav_lbl.text = (
+        self._set_lbl("_clav_lbl",
             f"shoulder follow: {state}  (strength {self._clav_weight:.2f})")
 
     def _toggle_clav_follow(self):
@@ -3602,7 +3412,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
     # --- Phase 1: One Euro smoothing controls ---
     def _update_smooth_lbl(self):
         state = "ON" if self._smooth_on else "OFF"
-        self._smooth_lbl.text = (
+        self._set_lbl("_smooth_lbl",
             f"smoothing: {state}  cutoff {self._smooth_cutoff:.2f}Hz  beta {self._smooth_beta:.3f}")
 
     def _push_smooth_params(self):
@@ -3671,7 +3481,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
     # ------------------------------------------------------------------
     # One-click automated follow-capture (streamlined debugging)
     # ------------------------------------------------------------------
-    _DEBUG_CAPTURE_PATH = r"c:\World\Institut_Setup3\_avatar_follow_capture.csv"
+    _DEBUG_CAPTURE_PATH = _data_path("_avatar_follow_capture.csv")
     _DEBUG_POSES = [
         "tpose", "reach_fwd", "reach_up", "reach_down", "reach_left", "reach_right",
         "reach_fwd_up", "reach_fwd_down", "reach_left_up", "reach_right_up",
@@ -3707,7 +3517,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
                 self._sim_pose = pose
                 self._sim_time = 0.0
                 self._debug_cap_lbl.text = (
-                    f"capture: {pose} ({i + 1}/{len(self._DEBUG_POSES)})…")
+                    f"capture: {pose} ({i + 1}/{len(self._DEBUG_POSES)})...")
                 for _ in range(settle):
                     await asyncio.sleep(0.016)
                 self._collect_capture_rows(rows, pose)
@@ -3723,7 +3533,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
                 self._sim_time = 0.0
                 for ang in (-90, -45, 0, 45, 90):
                     self._sim_wrist_twist = math.radians(ang)
-                    self._debug_cap_lbl.text = f"twist: {pose} {ang:+d}°…"
+                    self._debug_cap_lbl.text = f"twist: {pose} {ang:+d}deg..."
                     for _ in range(20):
                         await asyncio.sleep(0.016)
                     for is_right in (True, False):
@@ -3735,7 +3545,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
             self._sim_wrist_twist = 0.0
 
             self._write_capture(rows, twist_rows)
-            self._debug_cap_lbl.text = f"capture done → {self._DEBUG_CAPTURE_PATH}"
+            self._debug_cap_lbl.text = f"capture done -> {self._DEBUG_CAPTURE_PATH}"
             print(f"[avatar_xr_control] debug capture written: "
                   f"{self._DEBUG_CAPTURE_PATH} ({len(rows)} rows)")
         except Exception as e:
@@ -3848,6 +3658,8 @@ class AvatarXRControlExtension(omni.ext.IExt):
             orient_rows = []
             n = len(self._play_frames)
             prev_t = None
+            if self._skel is not None:
+                self._skel.set_deferred(True)   # one USD update per frame
             for i, fr in enumerate(self._play_frames):
                 t = fr.get("t", 0.0)
                 if prev_t is not None:
@@ -3863,6 +3675,8 @@ class AvatarXRControlExtension(omni.ext.IExt):
                 self._apply_head()
                 self._apply_upper_body()
                 self._apply_hand_tracking()
+                if self._skel is not None:
+                    self._skel.flush()
                 self._collect_capture_rows(rows, f"f{i}")
                 for is_right in (True, False):
                     d = self._hand_orient_diag.get(is_right)
@@ -3871,14 +3685,14 @@ class AvatarXRControlExtension(omni.ext.IExt):
                                             "arm": "R" if is_right else "L", **d})
                 if i % 20 == 0:
                     if getattr(self, "_capture_lbl", None) is not None:
-                        self._capture_lbl.text = f"capturing metrics {i}/{n}…"
+                        self._capture_lbl.text = f"capturing metrics {i}/{n}..."
                     await asyncio.sleep(0)   # keep the UI responsive
             self._write_capture(
                 rows, None, path=self._replay_capture_path,
                 title=f"Replay metrics capture ({n} frames, "
                       f"{os.path.basename(self._rec_path)})",
                 orient_rows=orient_rows)
-            self._set_track(f"replay metrics → {self._replay_capture_path} "
+            self._set_track(f"replay metrics -> {self._replay_capture_path} "
                             f"({len(rows)} rows)", 0xFF44FF44)
             print(f"[avatar_xr_control] replay capture written: "
                   f"{self._replay_capture_path} ({len(rows)} rows)")
@@ -3892,6 +3706,9 @@ class AvatarXRControlExtension(omni.ext.IExt):
             self._sim_enabled = prev_sim
             self._play_enabled = prev_play
             self._head_dev, self._left_dev, self._right_dev = saved_devs
+            self._restore_live_calib()
+            if self._skel is not None:
+                self._skel.set_deferred(False)   # flushes pending writes
             # Resume the background tracking loop if it was running before.
             if was_active and not self._xr_active:
                 self._start_tracking()
@@ -4139,8 +3956,8 @@ class AvatarXRControlExtension(omni.ext.IExt):
         m.SetTranslateOnly(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
         return m
 
-    _CALIB_DEBUG_PATH = r"c:\World\Institut_Setup3\_calib_debug.txt"
-    _CALIB_SAVE_PATH  = r"c:\World\Institut_Setup3\_avatar_calibration.json"
+    _CALIB_DEBUG_PATH = _data_path("_calib_debug.txt")
+    _CALIB_SAVE_PATH  = _data_path("_avatar_calibration.json")
 
     def _save_calibration(self):
         """Persist the per-user calibration (reach scale + shoulder anchors +
@@ -4161,6 +3978,11 @@ class AvatarXRControlExtension(omni.ext.IExt):
                 "l_shoulder_off": v(self._l_shoulder_off),
                 "r_wrist_offset": q(self._r_wrist_offset),
                 "l_wrist_offset": q(self._l_wrist_offset),
+                # Standing HMD head height — the crouch/sit baseline. Without it
+                # the next session falls back to the AVATAR's rest head height,
+                # skewing crouch detection for users taller/shorter than the avatar.
+                "calib_head_y":   (None if self._calib_head_y is None
+                                   else float(self._calib_head_y)),
             }
             with open(self._CALIB_SAVE_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -4188,6 +4010,9 @@ class AvatarXRControlExtension(omni.ext.IExt):
             self._symmetrize_shoulder_offsets()   # fix legacy asymmetric calibs
             self._r_wrist_offset = q(data.get("r_wrist_offset"))
             self._l_wrist_offset = q(data.get("l_wrist_offset"))
+            head_y = data.get("calib_head_y")
+            if head_y is not None:
+                self._calib_head_y = float(head_y)
             ok = (self._r_shoulder_off is not None
                   and self._l_shoulder_off is not None)
             if ok:
@@ -4387,6 +4212,14 @@ class AvatarXRControlExtension(omni.ext.IExt):
         self._status_lbl.text  = text
         self._status_lbl.style = {"font_size": 11, "color": 0xFF4444FF if error else 0xFF44FF44}
 
+    def _set_lbl(self, attr, text):
+        """Set a UI label's text if the label exists. The advanced-tuning
+        section was removed from the UI, but its handler methods stay callable
+        programmatically — their label updates must no-op, not crash."""
+        lbl = getattr(self, attr, None)
+        if lbl is not None:
+            lbl.text = text
+
     def _set_track(self, text, color=0xFFCCCCCC):
         self._track_lbl.text  = text
         self._track_lbl.style = {"font_size": 11, "color": color}
@@ -4561,7 +4394,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
 
     def _start_tracking(self):
         if self._skel is None:
-            self._set_track("No skeleton – open a stage first", 0xFF4444FF)
+            self._set_track("No skeleton - open a stage first", 0xFF4444FF)
             return
         ok, msg = self._init_xr()
         self._set_track(msg, 0xFF44FF44 if ok else 0xFF4444FF)
@@ -4614,6 +4447,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
     async def _tracking_loop(self):
         try:
             while self._xr_active:
+                sk_frame = self._skel   # flush the same object the frame wrote
                 try:
                     # Measure the real frame time so the exponential eases below
                     # stay correctly paced at any frame rate (clamped to ignore the
@@ -4622,6 +4456,10 @@ class AvatarXRControlExtension(omni.ext.IExt):
                     if self._last_frame_t is not None:
                         self._frame_dt = max(0.005, min(0.2, now - self._last_frame_t))
                     self._last_frame_t = now
+                    # Batch this frame's joint writes: flushed once per frame in
+                    # the finally below instead of a full-array USD Set per joint.
+                    if sk_frame is not None:
+                        sk_frame.set_deferred(True)
                     # Replay: swap in PlaybackDevices for this frame BEFORE anything
                     # reads them, so the whole pipeline runs off the recording.
                     self._advance_playback()
@@ -4634,10 +4472,6 @@ class AvatarXRControlExtension(omni.ext.IExt):
                     self._apply_hand_tracking()
                     # Record: snapshot the (real) device inputs this frame used.
                     self._record_frame()
-                    try:
-                        self._update_grab()
-                    except Exception:
-                        pass  # grab must never break tracking
                     try:
                         self._apply_stick_locomotion()
                     except Exception:
@@ -4655,9 +4489,18 @@ class AvatarXRControlExtension(omni.ext.IExt):
                     self._set_track(f"Error: {e}", 0xFF4444FF)
                     self._xr_active = False
                     break
+                finally:
+                    if sk_frame is not None:
+                        sk_frame.flush()
                 await asyncio.sleep(0.016)
         except asyncio.CancelledError:
             pass
+        finally:
+            # Restore immediate-write semantics (and push any pending writes)
+            # so UI callbacks outside the loop keep working unbatched.
+            sk = self._skel
+            if sk is not None:
+                sk.set_deferred(False)
 
     # ------------------------------------------------------------------
     # XR capture / replay
@@ -4819,12 +4662,24 @@ class AvatarXRControlExtension(omni.ext.IExt):
             except Exception:
                 pass
             self._rec_file = None
-        self._set_track(f"recorded {self._rec_count} frames → {self._rec_path}",
+        self._set_track(f"recorded {self._rec_count} frames -> {self._rec_path}",
                         0xFF44FF44)
         self._update_capture_lbl()
 
+    def _restore_live_calib(self):
+        """Undo the recording's calibration snapshot (applied by _load_recording)
+        so a live session after a replay runs on the user's own calibration."""
+        if self._live_calib is not None:
+            self._restore_calib(self._live_calib)
+            self._live_calib = None
+
     def _load_recording(self):
         self._play_frames = []
+        # The recording's meta line overwrites the calibration so the replay
+        # reproduces the recorded mapping — stash the LIVE calibration first
+        # (once; a replay-of-a-replay must not stash the recording's own values).
+        if self._live_calib is None:
+            self._live_calib = self._calib_snapshot()
         try:
             with open(self._rec_path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -4871,6 +4726,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
         if self._play_saved_devs is not None:
             self._head_dev, self._left_dev, self._right_dev = self._play_saved_devs
             self._play_saved_devs = None
+        self._restore_live_calib()
         # If replay started the loop for offline playback, stop it so it doesn't
         # keep spinning on the restored (null) devices.
         if self._play_started_loop:
@@ -4912,12 +4768,12 @@ class AvatarXRControlExtension(omni.ext.IExt):
         if lbl is None:
             return
         if self._rec_enabled:
-            lbl.text = f"● recording… {self._rec_count} frames"
+            lbl.text = f"recording... {self._rec_count} frames"
         elif self._play_enabled:
-            lbl.text = (f"▶ replaying {self._play_idx}/{len(self._play_frames)}"
+            lbl.text = (f"replaying {self._play_idx}/{len(self._play_frames)}"
                         f"  (loop {'on' if self._play_loop else 'off'})")
         else:
-            lbl.text = f"idle — {os.path.basename(self._rec_path)}"
+            lbl.text = f"idle - {os.path.basename(self._rec_path)}"
 
     # ------------------------------------------------------------------
     # Pose application
@@ -5188,7 +5044,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
 
     def _toggle_coll_debug(self):
         self._coll_debug_on = not self._coll_debug_on
-        self._coll_lbl.text = (
+        self._set_lbl("_coll_lbl",
             f"collision shapes: {'ON' if self._coll_debug_on else 'off'}")
         stage = omni.usd.get_context().get_stage()
         if self._coll_debug_on:
@@ -5198,7 +5054,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
 
     # --- Torso volume tuning ---
     def _update_torso_lbl(self):
-        self._torso_lbl.text = (
+        self._set_lbl("_torso_lbl",
             f"torso fwd {self._torso_fwd:+.02f}  width {self._torso_half_x:.02f}"
             f"  depth {self._torso_half_z:.02f} m")
 
@@ -5236,7 +5092,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
         self._apply_torso_change()
 
     def _update_body_push_lbl(self):
-        self._body_push_lbl.text = (
+        self._set_lbl("_body_push_lbl",
             f"hand body-collision: {'ON' if self._body_push else 'off'}")
 
     def _toggle_body_push(self):
@@ -5245,7 +5101,8 @@ class AvatarXRControlExtension(omni.ext.IExt):
 
     def _update_phys_lbl(self):
         if not _PHYS_AVAILABLE:
-            self._phys_lbl.text = "physics collision: UNAVAILABLE (omni.physx not loaded)"
+            self._set_lbl("_phys_lbl",
+                          "physics collision: UNAVAILABLE (omni.physx not loaded)")
             return
         env = "env+self" if self._phys_env else "self only"
         sh = ", shoulder-push" if self._phys_shoulder_push else ""
@@ -5253,7 +5110,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
                  if self._phys_collision else "off")
         ready = "" if (not self._phys_collision or self._phys_scene_ready) \
                 else " — scene not ready"
-        self._phys_lbl.text = f"physics collision: {state}{ready}"
+        self._set_lbl("_phys_lbl", f"physics collision: {state}{ready}")
 
     def _toggle_phys_collision(self):
         if not _PHYS_AVAILABLE:
@@ -5294,7 +5151,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
         self._update_phys_lbl()
 
     def _update_fore_roll_lbl(self):
-        self._fore_roll_lbl.text = (
+        self._set_lbl("_fore_roll_lbl",
             f"wrist twist -> forearm: {self._fore_roll * 100:.0f}%")
 
     def _fore_roll_dn(self):
@@ -5306,7 +5163,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
         self._update_fore_roll_lbl()
 
     def _update_elbow_roll_lbl(self):
-        self._elbow_roll_lbl.text = (
+        self._set_lbl("_elbow_roll_lbl",
             f"controller roll -> elbow: {self._elbow_roll_weight * 100:.0f}%")
 
     def _elbow_roll_dn(self):
@@ -5321,7 +5178,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
 
     def _update_finger_curl_lbl(self):
         state = "ON" if self._finger_curl_on else "off"
-        self._finger_curl_lbl.text = (
+        self._set_lbl("_finger_curl_lbl",
             f"finger curl (controllers): {state} @ {self._finger_curl_deg:.0f}deg")
 
     def _toggle_finger_curl(self):
@@ -5337,7 +5194,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
         self._update_finger_curl_lbl()
 
     def _update_limits_lbl(self):
-        self._limits_lbl.text = (
+        self._set_lbl("_limits_lbl",
             f"joint limits: {'ON' if self._limits_on else 'off'}")
 
     def _toggle_limits(self):
@@ -5594,11 +5451,11 @@ class AvatarXRControlExtension(omni.ext.IExt):
         # --- Diagnostic: log the RAW arm_vec (XR space) for the right arm once
         # per ~second, so the XR→stage axis mapping can be derived from real
         # reaches instead of guessed. Remove once mapping is confirmed.
-        if is_right:
+        if is_right and DEBUG_FILES:
             self._armvec_tick = getattr(self, "_armvec_tick", 0) + 1
             if self._armvec_tick % 60 == 0:
                 try:
-                    with open(r"c:\World\Institut_Setup3\_armvec_debug.txt",
+                    with open(_data_path("_armvec_debug.txt"),
                               "a", encoding="utf-8") as f:
                         f.write(
                             f"arm_vec=({arm_vec[0]:+.3f},{arm_vec[1]:+.3f},"
@@ -5855,188 +5712,11 @@ class AvatarXRControlExtension(omni.ext.IExt):
         wp = m.Transform(Gf.Vec3d(p[0], p[1], p[2]))
         return Gf.Vec3f(float(wp[0]), float(wp[1]), float(wp[2]))
 
-    @staticmethod
-    def _prim_world_pos(prim):
-        m = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-        t = m.ExtractTranslation()
-        return Gf.Vec3f(float(t[0]), float(t[1]), float(t[2]))
-
-    @staticmethod
-    def _is_grabbable(prim):
-        """Grabbable = a MOVABLE physics object: a valid, non-instance-proxy prim
-        with a DYNAMIC (non-kinematic, enabled) RigidBodyAPI. Static scenery (no
-        rigid body, e.g. the packing table) and kinematic/frozen bodies are never
-        grabbed, so the hand can't drag fixed props — and authoring on instanced
-        meshes (the 'instance proxy not allowed' errors) can't happen.
-
-        To make an object immovable-by-hand: leave it static or set it kinematic.
-        To make an object grabbable: give it a dynamic RigidBodyAPI."""
-        if prim is None or not prim.IsValid() or prim.IsInstanceProxy():
-            return False
-        if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
-            return False
-        rb = UsdPhysics.RigidBodyAPI(prim)
-        if rb.GetKinematicEnabledAttr().Get():
-            return False
-        if rb.GetRigidBodyEnabledAttr().Get() is False:
-            return False
-        return True
-
-    def _set_prim_world_pos(self, prim, world_pos):
-        """Set a prim's translate op so it lands at world_pos (accounts for parent)."""
-        if not self._is_grabbable(prim):
-            return
-        xform = UsdGeom.Xformable(prim)
-        parent = prim.GetParent()
-        local = world_pos
-        if parent and parent.IsValid():
-            pm = UsdGeom.Xformable(parent).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-            inv = pm.GetInverse()
-            lp = inv.Transform(Gf.Vec3d(world_pos[0], world_pos[1], world_pos[2]))
-            local = Gf.Vec3d(lp[0], lp[1], lp[2])
-        translate_op = None
-        for op in xform.GetOrderedXformOps():
-            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
-                translate_op = op
-                break
-        if translate_op is None:
-            translate_op = xform.AddTranslateOp()
-        translate_op.Set(Gf.Vec3d(local[0], local[1], local[2]))
-
-    @staticmethod
-    def _set_body_kinematic(prim, value):
-        """Set a rigid body's kinematicEnabled, returning its PREVIOUS value (or
-        None if the prim has no RigidBodyAPI). Used to freeze a held dynamic object
-        so the grab follow doesn't fight PhysX, and to restore it on release."""
-        if prim is None or not prim.IsValid() or not prim.HasAPI(UsdPhysics.RigidBodyAPI):
-            return None
-        rb = UsdPhysics.RigidBodyAPI(prim)
-        attr = rb.GetKinematicEnabledAttr()
-        prev = attr.Get() if attr and attr.HasAuthoredValue() else False
-        rb.CreateKinematicEnabledAttr().Set(bool(value))
-        return bool(prev)
-
-    def _release_grab(self, stage, is_right):
-        """Drop whatever this hand holds: restore the body's prior kinematic state
-        (back to dynamic) so gravity/contacts resume, and clear the grab slots."""
-        held = self._grabbed.get(is_right)
-        prev = self._grab_prev_kin.get(is_right)
-        if held is not None and prev is not None:
-            prim = stage.GetPrimAtPath(held) if stage is not None else None
-            if prim is not None and prim.IsValid():
-                self._set_body_kinematic(prim, prev)
-        self._grabbed[is_right] = None
-        self._grab_offset[is_right] = None
-        self._grab_prev_kin[is_right] = None
-
-    def _update_grab(self):
-        if not self._grab_enabled:
-            return
-        stage = omni.usd.get_context().get_stage()
-        if stage is None:
-            return
-
-        self._grab_diag_tick = getattr(self, "_grab_diag_tick", 0) + 1
-        write_diag = (self._grab_diag_tick % 60 == 0)
-
-        for is_right in (True, False):
-            wrist = self._hand_world.get(is_right)
-            if wrist is None:
-                if write_diag and is_right:
-                    try:
-                        with open(r"c:\World\Institut_Setup3\_grab_debug.txt", "w", encoding="utf-8") as f:
-                            f.write("hand_world is None — IK not running or not calibrated\n")
-                    except Exception:
-                        pass
-                continue
-            # Grab reference = the PALM (wrist extended toward the fingers along the
-            # forearm→hand direction), so distance and the held offset are measured
-            # where the hand mesh actually is, not at the wrist joint behind it.
-            hand = wrist
-            elbow = self._elbow_world.get(is_right)
-            if elbow is not None:
-                fdir = _sub(wrist, elbow)
-                fl = _len(fdir)
-                if fl > 1e-5:
-                    hand = _add(wrist, _scale(fdir, self._grab_reach / fl))
-
-            dev = self._right_dev if is_right else self._left_dev
-            grip = _grip_value(dev)
-            held = self._grabbed[is_right]
-            # Hysteresis: grab needs grip >= threshold, release needs grip < 0.1.
-            # Prevents one-frame flicker when the XR poll reads 0 between presses.
-            if held is not None:
-                pressed = grip >= 0.1
-            else:
-                pressed = grip >= self._grab_threshold
-
-            if write_diag and is_right:
-                try:
-                    lines = [
-                        f"grip_R={grip:.3f}  threshold={self._grab_threshold:.2f}  pressed={pressed}",
-                        f"hand=({hand[0]:.3f}, {hand[1]:.3f}, {hand[2]:.3f})",
-                    ]
-                    for path in self._grab_candidates:
-                        prim = stage.GetPrimAtPath(path)
-                        if not prim.IsValid():
-                            lines.append(f"  {path}: PRIM NOT FOUND")
-                            continue
-                        pos = self._prim_world_pos(prim)
-                        d = _len(_sub(pos, hand))
-                        lines.append(
-                            f"  {path}: pos=({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f})"
-                            f"  dist={d:.3f}  radius={self._grab_radius:.3f}"
-                            f"  {'IN RANGE' if d < self._grab_radius else 'too far'}"
-                        )
-                    with open(r"c:\World\Institut_Setup3\_grab_debug.txt", "w", encoding="utf-8") as f:
-                        f.write("\n".join(lines) + "\n")
-                except Exception:
-                    pass
-
-            if held is not None:
-                # Holding: release the moment the trigger/grip is let go (precise
-                # placement — the object stays exactly where it was set down).
-                if not pressed:
-                    self._release_grab(stage, is_right)
-                    continue
-                prim = stage.GetPrimAtPath(held)
-                if not prim.IsValid():
-                    self._release_grab(stage, is_right)
-                    continue
-                off = self._grab_offset[is_right] or Gf.Vec3f(0, 0, 0)
-                self._set_prim_world_pos(prim, _add(hand, off))
-            else:
-                # Not holding: only grab while the button is pressed AND the hand
-                # is within radius of the nearest candidate.
-                if not pressed:
-                    continue
-                best, best_d = None, self._grab_radius
-                for path in self._grab_candidates:
-                    # Skip if already held by the other hand.
-                    if path == self._grabbed[not is_right]:
-                        continue
-                    prim = stage.GetPrimAtPath(path)
-                    # Skip invalid / immovable prims (instance proxies, non-Xformable)
-                    # so the hand can't grab scenery it can't actually move.
-                    if not self._is_grabbable(prim):
-                        continue
-                    d = _len(_sub(self._prim_world_pos(prim), hand))
-                    if d < best_d:
-                        best, best_d = path, d
-                if best is not None:
-                    prim = stage.GetPrimAtPath(best)
-                    self._grabbed[is_right] = best
-                    # Preserve the hand→object offset at grab time so it doesn't snap.
-                    self._grab_offset[is_right] = _sub(self._prim_world_pos(prim), hand)
-                    # Flip a dynamic body to kinematic while held so the USD-driven
-                    # follow below doesn't fight PhysX; remember its prior state.
-                    self._grab_prev_kin[is_right] = self._set_body_kinematic(prim, True)
-
     # ------------------------------------------------------------------
     # Finger-tracking diagnostic (read-only — writes _finger_diag.txt)
     # ------------------------------------------------------------------
 
-    _FINGER_DIAG_PATH = r"c:\World\Institut_Setup3\_finger_diag.txt"
+    _FINGER_DIAG_PATH = _data_path("_finger_diag.txt")
 
     def _diagnose_fingers(self):
         """Probe whether optical hand-tracking finger joints are arriving from
@@ -6137,7 +5817,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
             if present > 0:
                 any_fingers = True
 
-        verdict = ("FINGERS DETECTED — tracking data is arriving."
+        verdict = ("FINGERS DETECTED - tracking data is arriving."
                    if any_fingers else
                    "NO finger joints. Check: controllers down? Quest hand-tracking "
                    "ON? ALVR 'Hand skeleton' ON? SteamVR forwarding XR_EXT_hand_tracking?")
@@ -6155,7 +5835,7 @@ class AvatarXRControlExtension(omni.ext.IExt):
     def _apply_head(self):
         m = _get_pose(self._head_dev)
         if m is None:
-            self._set_track("No head pose — is XR session active?", 0xFFFFAA33)
+            self._set_track("No head pose - is XR session active?", 0xFFFFAA33)
             return
         quatf = _correct_xr_quat(m.ExtractRotationQuat())
         # Undo the root yaw (camera follow): the joint expects an avatar-local
