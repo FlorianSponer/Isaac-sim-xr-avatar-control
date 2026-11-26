@@ -37,7 +37,7 @@ in real time from a VR headset and its controllers:
 - Procedural walking (Route B gait with foot placement) tuned and stable
 - Physics colliders and grab interaction functional
 - Timeout handling self-healing (no more permanent red errors)
-- Portable deployment (paths no longer hardcoded)
+- Portable deployment 
 - One Euro smoothing on all tracked inputs
 
 ## Repository contents
